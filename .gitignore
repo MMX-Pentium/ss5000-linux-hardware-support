@@ -1,0 +1,29 @@
+# Kernel module build products
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Imported build environments and large archives
+headers/
+linux-v7.0-sparse/
+*.tar
+*.tar.gz
+*.tgz
+
+# Vendor-derived and generated binaries are intentionally not published
+rtkctl-flat*
+target-files/usr/local/libexec/ss5000-led-hw
+target-files/usr/local/libexec/ss5000-mgmt-announce
+
+# Editor and local files
+.*.swp
+.DS_Store
+

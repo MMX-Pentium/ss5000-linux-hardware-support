@@ -1,0 +1,5 @@
+[Match]
+Driver=asix
+
+[Link]
+Name=mgmt0

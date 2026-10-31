@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+filtered=()
+for argument in "$@"; do
+    case "$argument" in
+        -fmin-function-alignment=*)
+            continue
+            ;;
+    esac
+    filtered+=("$argument")
+done
+
+exec gcc "${filtered[@]}"

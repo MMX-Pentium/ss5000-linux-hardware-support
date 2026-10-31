@@ -1,0 +1,11 @@
+network:
+  version: 2
+  ethernets:
+    l2sw:
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - 192.168.20.254/24
+      accept-ra: false
+      link-local: []
+      optional: true

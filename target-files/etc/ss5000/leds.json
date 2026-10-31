@@ -1,0 +1,35 @@
+{
+  "alarm": {
+    "color": "red",
+    "enabled": false,
+    "length": 3,
+    "speed": 1
+  },
+  "leds": {
+    "info1": {
+      "color": "off",
+      "mode": "solid"
+    },
+    "info2": {
+      "color": "off",
+      "mode": "solid"
+    },
+    "info3": {
+      "color": "off",
+      "mode": "solid"
+    },
+    "info4": {
+      "color": "off",
+      "mode": "solid"
+    },
+    "power": {
+      "color": "blue",
+      "mode": "solid"
+    },
+    "status": {
+      "color": "off",
+      "mode": "solid"
+    }
+  },
+  "version": 1
+}

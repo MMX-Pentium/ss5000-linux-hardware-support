@@ -1,0 +1,13 @@
+[Unit]
+Description=Prime SS5000 USB management link and ARP state
+After=systemd-networkd.service network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/ss5000-mgmt-prime
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

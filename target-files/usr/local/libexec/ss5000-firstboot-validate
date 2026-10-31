@@ -1,0 +1,126 @@
+#!/bin/sh
+set -u
+
+STATE_DIR=/var/lib/ss5000-install
+REPORT=$STATE_DIR/firstboot-report.txt
+COMPLETE=$STATE_DIR/firstboot-complete
+EXPECTED_KERNEL=7.0.0-14-generic
+EXPECTED_IGB_SHA256=637ae0236a9c0c9d6e1bd98f7263dc1e4f54f991a03ac055d90824f5c667e574
+EXPECTED_RTKCTL_SHA256=3454ceccf0aa9a094d2db6a37756759605d4119dc3fb6e945e11d87172fbea68
+
+install -d -m 0700 "$STATE_DIR"
+temporary=$(mktemp /run/ss5000-firstboot.XXXXXX)
+failures=0
+
+record()
+{
+	printf '%s\n' "$*" >>"$temporary"
+}
+
+pass()
+{
+	record "PASS: $*"
+}
+
+fail()
+{
+	record "FAIL: $*"
+	failures=$((failures + 1))
+}
+
+record "SS5000 first-boot validation"
+record "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+record "kernel=$(uname -r)"
+
+if [ "$(uname -r)" = "$EXPECTED_KERNEL" ]; then
+	pass "kernel is $EXPECTED_KERNEL"
+else
+	fail "expected kernel $EXPECTED_KERNEL, found $(uname -r)"
+fi
+
+igb_path=$(/usr/sbin/modinfo -n igb 2>/dev/null || true)
+if [ -f "$igb_path" ]; then
+	igb_hash=$(sha256sum "$igb_path" | awk '{print $1}')
+	[ "$igb_hash" = "$EXPECTED_IGB_SHA256" ] &&
+		pass "patched igb module hash matched" ||
+		fail "patched igb module hash mismatch: $igb_hash"
+else
+	fail "igb module path is unavailable"
+fi
+
+if [ -x /usr/local/sbin/ss5000-rtkctl ]; then
+	rtkctl_hash=$(sha256sum /usr/local/sbin/ss5000-rtkctl | awk '{print $1}')
+	[ "$rtkctl_hash" = "$EXPECTED_RTKCTL_SHA256" ] &&
+		pass "vendor rtkctl hash matched" ||
+		fail "vendor rtkctl hash mismatch: $rtkctl_hash"
+else
+	fail "vendor rtkctl is missing"
+fi
+
+wdt=$(/usr/sbin/sio -d 8 30 f0 f1 f2 2>&1 || true)
+printf '%s\n' "$wdt" | grep -q 'R 0x30 0x02' &&
+	pass "NCT6116 watchdog is disabled" ||
+	fail "NCT6116 watchdog state is not disabled: $wdt"
+
+attempt=0
+while [ "$attempt" -lt 90 ]; do
+	if ip -4 -o address show dev mgmt0 2>/dev/null |
+		grep -q '10\.1\.5\.254/24' &&
+		ip -4 -o address show dev l2sw 2>/dev/null |
+		grep -q '192\.168\.20\.254/24'; then
+		break
+	fi
+	sleep 1
+	attempt=$((attempt + 1))
+done
+
+for service in \
+	ss5000-wdt-off.service \
+	ss5000-l2sw.service \
+	ss5000-led.service \
+	ss5000-mgmt-prime.service \
+	serial-getty@ttyS0.service \
+	ssh.socket; do
+	if systemctl is-active --quiet "$service"; then
+		pass "$service is active"
+	else
+		fail "$service is not active"
+	fi
+done
+
+ip -4 -o address show dev mgmt0 2>/dev/null |
+	grep -q '10\.1\.5\.254/24' &&
+	pass "mgmt0 has 10.1.5.254/24" ||
+	fail "mgmt0 does not have 10.1.5.254/24"
+
+ip -4 -o address show dev l2sw 2>/dev/null |
+	grep -q '192\.168\.20\.254/24' &&
+	pass "l2sw has 192.168.20.254/24" ||
+	fail "l2sw does not have 192.168.20.254/24"
+
+if /usr/sbin/netplan generate >>"$temporary" 2>&1; then
+	pass "netplan configuration generated successfully"
+else
+	fail "netplan generation failed"
+fi
+
+{
+	record "mgmt_mac=$(cat /sys/class/net/mgmt0/address 2>/dev/null || true)"
+	record "l2sw_mac=$(cat /sys/class/net/l2sw/address 2>/dev/null || true)"
+	record "failures=$failures"
+} >/dev/null
+
+install -m 0600 "$temporary" "$REPORT"
+
+if [ "$failures" -ne 0 ]; then
+	/usr/local/sbin/ss5000-led alarm start red --length 3 --speed 1 \
+		>/dev/null 2>&1 || true
+	logger -t ss5000-firstboot "validation failed; see $REPORT"
+	exit 1
+fi
+
+/usr/local/sbin/ss5000-led alarm stop >/dev/null 2>&1 || true
+date -u +%Y-%m-%dT%H:%M:%SZ >"$COMPLETE"
+chmod 0600 "$COMPLETE"
+logger -t ss5000-firstboot "validation passed; see $REPORT"
+exit 0

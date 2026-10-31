@@ -1,0 +1,101 @@
+#!/bin/sh
+set -eu
+
+CONFIG_TOOL=/usr/local/sbin/ss5000-l2sw-config
+RTKCTL=/run/ss5000/rtkctl-configured
+PCI_ID=0000:02:00.0
+PCI_DEV=/sys/bus/pci/devices/$PCI_ID
+PCI_NET=$PCI_DEV/net
+IGB_DRIVER=/sys/bus/pci/drivers/igb
+
+# Validate the saved configuration and build the fixed-offset vendor utility
+# before touching the live PCI device.
+"$CONFIG_TOOL" render
+
+# Configuration writes through rtkctl access the I210's PCI/MDIO resources
+# directly.  Never issue them concurrently with a bound igb driver.  The module
+# is already available
+# from the initramfs, so detach only the switch-facing I210 while leaving
+# the two independent igb NICs operational.
+if [ -L "$PCI_DEV/driver" ]; then
+	if [ "$(basename "$(readlink "$PCI_DEV/driver")")" != "igb" ]; then
+		echo "SS5000 L2SW: PCI device is owned by an unexpected driver" >&2
+		exit 1
+	fi
+	echo "$PCI_ID" > "$IGB_DRIVER/unbind"
+fi
+
+rebind_i210()
+{
+	if [ ! -L "$PCI_DEV/driver" ]; then
+		echo "$PCI_ID" > "$IGB_DRIVER/bind" 2>/dev/null || true
+	fi
+}
+trap rebind_i210 EXIT HUP INT TERM
+
+i=0
+while [ -L "$PCI_DEV/driver" ]; do
+	i=$((i + 1))
+	if [ "$i" -ge 100 ]; then
+		echo "SS5000 L2SW: failed to detach I210 from igb" >&2
+		exit 1
+	fi
+	sleep 0.1
+done
+
+"$RTKCTL" init
+"$RTKCTL" up
+# rtk_port_macForceLinkExt_set() reports nway disabled but does not program
+# the RTL8367C's dedicated SGMII nway control.  Without this explicit call,
+# signal/sync are present while the SerDes link remains down and no frames
+# cross between EXT_PORT0 and the I210.
+"$RTKCTL" sgmii nway off
+"$RTKCTL" setvlan
+"$RTKCTL" phy-enable
+
+# Match the original firmware's ordering: the RTL8367C CPU port is already
+# configured and up before igb resets/configures the I210 PCS.
+echo "$PCI_ID" > "$IGB_DRIVER/bind"
+trap - EXIT HUP INT TERM
+
+i=0
+while [ ! -d "$PCI_NET" ] || ! find "$PCI_NET" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; do
+	i=$((i + 1))
+	if [ "$i" -ge 100 ]; then
+		echo "SS5000 L2SW: I210 did not bind after switch initialization" >&2
+		exit 1
+	fi
+	sleep 0.1
+done
+
+IFACE=$(find "$PCI_NET" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -n 1)
+
+# This service runs before network-pre.target, so networkd cannot raise the
+# interface while the service is waiting.  Bring the freshly rebound I210
+# administratively up here; otherwise the boot path deadlocks until this
+# service fails and releases network-pre.target.
+/usr/sbin/ip link set dev "$IFACE" up
+
+# Verify that the dedicated RTL8367C SerDes state, not merely the forced MAC
+# state, reached link-up.  A failed check makes systemd report failure so the
+# configuration frontend can restore its last known-good file.
+i=0
+while ! "$RTKCTL" sgmii |
+	sed -n '/STATUS: rtk_port_sgmiiLinkStatus_get/,$p' |
+	grep -q 'link:.*1 (PORT_LINKUP)'; do
+	i=$((i + 1))
+	if [ "$i" -ge 60 ]; then
+		echo "SS5000 L2SW: SGMII did not reach link-up" >&2
+		exit 1
+	fi
+	sleep 0.5
+done
+
+"$CONFIG_TOOL" sync-links
+
+# Record the configuration that actually reached link-up. The frontend uses
+# this as its automatic rollback point for later operator changes.
+install -D -m 0600 /etc/ss5000/l2sw-vlans.json \
+	/var/lib/ss5000-l2sw/active.json
+
+echo "SS5000 L2SW: initialized RTL8367C via $IFACE"

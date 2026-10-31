@@ -1,0 +1,467 @@
+#!/usr/bin/python3
+"""Persistent front-panel LED controller for the SAXA SS5000."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+CONFIG_PATH = Path("/etc/ss5000/leds.json")
+LOCK_PATH = Path("/run/ss5000/led-config.lock")
+HARDWARE_HELPER = "/usr/local/libexec/ss5000-led-hw"
+SERVICE = "ss5000-led.service"
+READY_PATH = Path("/run/ss5000/led-ready")
+MAX_CONFIG_SIZE = 65536
+
+LEDS = ("power", "status", "info1", "info2", "info3", "info4")
+COLORS = ("off", "blue", "red", "purple")
+MODES = ("solid", "slow", "normal", "fast")
+ALARM_COLORS = ("red", "blue", "purple")
+HALF_PERIOD = {"slow": 1.0, "normal": 0.5, "fast": 0.1}
+ALARM_TICK = 0.1
+
+# bank, blue mask, red mask. POWER blue alone is active-low in the original
+# SAXA siogpio driver; every other LED output is active-high.
+LED_MAP = {
+    "power": (1, 0x80, 0x40),
+    "status": (1, 0x20, 0x10),
+    "info1": (1, 0x08, 0x04),
+    "info2": (1, 0x02, 0x01),
+    "info3": (4, 0x02, 0x01),
+    "info4": (4, 0x08, 0x04),
+}
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise ConfigError(message)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        fail("this operation must be run as root (use sudo)")
+
+
+def read_json(path: Path) -> Any:
+    try:
+        stat = path.stat()
+        if not path.is_file():
+            fail(f"{path}: regular file required")
+        if stat.st_size > MAX_CONFIG_SIZE:
+            fail(f"{path}: file is larger than {MAX_CONFIG_SIZE} bytes")
+        with path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        fail(f"{path}: not found")
+    except json.JSONDecodeError as exc:
+        fail(f"{path}:{exc.lineno}:{exc.colno}: {exc.msg}")
+
+
+def canonical_config(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        fail("top-level value must be an object")
+    allowed = {"version", "leds", "alarm"}
+    unknown = set(raw) - allowed
+    if unknown:
+        fail("unknown top-level keys: " + ", ".join(sorted(unknown)))
+    if not {"version", "leds"} <= set(raw):
+        fail("top-level keys must include: version, leds")
+    if raw["version"] != 1:
+        fail("version must be 1")
+    values = raw["leds"]
+    if not isinstance(values, dict) or set(values) != set(LEDS):
+        fail("leds must contain exactly: " + ", ".join(LEDS))
+
+    result: dict[str, dict[str, str]] = {}
+    for name in LEDS:
+        entry = values[name]
+        if not isinstance(entry, dict) or set(entry) != {"color", "mode"}:
+            fail(f"leds.{name} must contain exactly: color, mode")
+        color = entry["color"]
+        mode = entry["mode"]
+        if color not in COLORS:
+            fail(f"leds.{name}.color must be one of: {', '.join(COLORS)}")
+        if mode not in MODES:
+            fail(f"leds.{name}.mode must be one of: {', '.join(MODES)}")
+        if color == "off":
+            mode = "solid"
+        result[name] = {"color": color, "mode": mode}
+
+    alarm = raw.get(
+        "alarm",
+        {
+            "enabled": False,
+            "color": "red",
+            "length": 3,
+            "speed": 1,
+        },
+    )
+    if not isinstance(alarm, dict) or set(alarm) != {
+        "enabled",
+        "color",
+        "length",
+        "speed",
+    }:
+        fail("alarm must contain exactly: enabled, color, length, speed")
+    enabled = alarm["enabled"]
+    color = alarm["color"]
+    length = alarm["length"]
+    speed = alarm["speed"]
+    if not isinstance(enabled, bool):
+        fail("alarm.enabled must be true or false")
+    if color not in ALARM_COLORS:
+        fail("alarm.color must be one of: " + ", ".join(ALARM_COLORS))
+    if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= 4:
+        fail("alarm.length must be in the range 1..4")
+    if isinstance(speed, bool) or not isinstance(speed, int) or not 1 <= speed <= 20:
+        fail("alarm.speed must be in the range 1..20")
+
+    return {
+        "version": 1,
+        "leds": result,
+        "alarm": {
+            "enabled": enabled,
+            "color": color,
+            "length": length,
+            "speed": speed,
+        },
+    }
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    return canonical_config(read_json(path))
+
+
+def encode_json(config: dict[str, Any]) -> bytes:
+    return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def atomic_write(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    owner = None
+    try:
+        stat = path.stat()
+        owner = (stat.st_uid, stat.st_gid)
+    except FileNotFoundError:
+        pass
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        if owner is not None:
+            os.fchown(descriptor, *owner)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+@contextmanager
+def configuration_lock():
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def run_command(arguments: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    )
+
+
+def restart_service() -> None:
+    expected = hashlib.sha256(encode_json(load_config())).hexdigest()
+    try:
+        READY_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    result = run_command(
+        ["/usr/bin/systemctl", "restart", SERVICE],
+        check=False,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr, end="")
+        fail(f"{SERVICE} failed to apply the configuration")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            if READY_PATH.read_text(encoding="ascii").strip() == expected:
+                return
+        except FileNotFoundError:
+            pass
+        time.sleep(0.05)
+    fail(f"{SERVICE} did not confirm hardware application")
+
+
+def command_validate(args: argparse.Namespace) -> None:
+    config = load_config(args.file)
+    print(json.dumps(config, indent=2, sort_keys=True))
+    print("configuration is valid")
+
+
+def command_show(args: argparse.Namespace) -> None:
+    config = load_config(args.file)
+    alarm = config["alarm"]
+    if alarm["enabled"]:
+        print(
+            "alarm: enabled, "
+            f"{alarm['color']}, length={alarm['length']}, speed={alarm['speed']}"
+        )
+    else:
+        print("alarm: disabled")
+    for name in LEDS:
+        entry = config["leds"][name]
+        print(f"{name}: {entry['color']}, {entry['mode']}")
+
+
+def command_set(args: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        config["leds"][args.led] = {"color": args.color, "mode": args.mode}
+        config["alarm"]["enabled"] = False
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        restart_service()
+    print(f"{args.led}: {args.color}, {config['leds'][args.led]['mode']}")
+
+
+def command_all(args: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        for name in LEDS:
+            config["leds"][name] = {"color": args.color, "mode": args.mode}
+        config["alarm"]["enabled"] = False
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        restart_service()
+    print(f"all LEDs: {args.color}, {config['leds']['power']['mode']}")
+
+
+def command_apply(_: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        load_config()
+        restart_service()
+    print("LED configuration applied")
+
+
+def command_alarm_start(args: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        config["alarm"] = {
+            "enabled": True,
+            "color": args.color,
+            "length": args.length,
+            "speed": args.speed,
+        }
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        restart_service()
+    print(
+        f"alarm started: {args.color}, "
+        f"length={args.length}, speed={args.speed}"
+    )
+
+
+def command_alarm_stop(_: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        config["alarm"]["enabled"] = False
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        restart_service()
+    print("alarm stopped; restored the normal LED configuration")
+
+
+def command_status(_: argparse.Namespace) -> None:
+    config = load_config()
+    command_show(argparse.Namespace(file=CONFIG_PATH))
+    service = run_command(
+        ["/usr/bin/systemctl", "is-active", SERVICE],
+        check=False,
+    ).stdout.strip()
+    print(f"service: {service}")
+    if os.geteuid() == 0:
+        hardware = run_command([HARDWARE_HELPER, "snapshot"], check=False)
+        print("hardware: " + hardware.stdout.strip())
+
+
+def is_on(entry: dict[str, str], elapsed: float) -> bool:
+    if entry["color"] == "off":
+        return False
+    if entry["mode"] == "solid":
+        return True
+    return int(elapsed / HALF_PERIOD[entry["mode"]]) % 2 == 0
+
+
+def alarm_entries(config: dict[str, Any], elapsed: float) -> dict[str, dict[str, str]]:
+    alarm = config["alarm"]
+    frame_count = 6 + alarm["length"]
+    frame = int(elapsed / (ALARM_TICK * alarm["speed"])) % frame_count
+    head = 5 - frame
+    active = {
+        position
+        for position in range(6)
+        if head <= position < head + alarm["length"]
+    }
+    return {
+        name: {
+            "color": alarm["color"] if position in active else "off",
+            "mode": "solid",
+        }
+        for position, name in enumerate(LEDS)
+    }
+
+
+def hardware_values(config: dict[str, Any], elapsed: float) -> tuple[int, int]:
+    values = {1: 0x80, 4: 0x00}
+    entries = (
+        alarm_entries(config, elapsed)
+        if config["alarm"]["enabled"]
+        else config["leds"]
+    )
+    for name in LEDS:
+        entry = entries[name]
+        active = is_on(entry, elapsed)
+        bank, blue_mask, red_mask = LED_MAP[name]
+        blue = active and entry["color"] in {"blue", "purple"}
+        red = active and entry["color"] in {"red", "purple"}
+        if name == "power":
+            if blue:
+                values[bank] &= ~blue_mask
+            else:
+                values[bank] |= blue_mask
+        elif blue:
+            values[bank] |= blue_mask
+        if red:
+            values[bank] |= red_mask
+    return values[1], values[4]
+
+
+def command_daemon(_: argparse.Namespace) -> None:
+    require_root()
+    config = load_config()
+    stop = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    start = time.monotonic()
+    previous: tuple[int, int] | None = None
+    ready_announced = False
+    digest = hashlib.sha256(encode_json(config)).hexdigest()
+    has_blink = config["alarm"]["enabled"] or any(
+        entry["color"] != "off" and entry["mode"] != "solid"
+        for entry in config["leds"].values()
+    )
+    sleep_interval = 0.025 if has_blink else 1.0
+
+    while not stop:
+        desired = hardware_values(config, time.monotonic() - start)
+        if desired != previous:
+            run_command([HARDWARE_HELPER, "write", "1", "0xff", hex(desired[0])])
+            run_command([HARDWARE_HELPER, "write", "4", "0x0f", hex(desired[1])])
+            previous = desired
+            if not ready_announced:
+                atomic_write(READY_PATH, (digest + "\n").encode("ascii"), 0o644)
+                ready_announced = True
+        time.sleep(sleep_interval)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Control SS5000 front-panel LEDs")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate = subparsers.add_parser("validate", help="validate an LED configuration")
+    validate.add_argument("file", nargs="?", type=Path, default=CONFIG_PATH)
+    validate.set_defaults(handler=command_validate)
+
+    show = subparsers.add_parser("show", help="show the saved LED configuration")
+    show.add_argument("file", nargs="?", type=Path, default=CONFIG_PATH)
+    show.set_defaults(handler=command_show)
+
+    set_led = subparsers.add_parser("set", help="set one LED")
+    set_led.add_argument("led", choices=LEDS)
+    set_led.add_argument("color", choices=COLORS)
+    set_led.add_argument("--mode", choices=MODES, default="solid")
+    set_led.set_defaults(handler=command_set)
+
+    all_leds = subparsers.add_parser("all", help="set all six LEDs")
+    all_leds.add_argument("color", choices=COLORS)
+    all_leds.add_argument("--mode", choices=MODES, default="solid")
+    all_leds.set_defaults(handler=command_all)
+
+    alarm = subparsers.add_parser("alarm", help="control the flowing alarm pattern")
+    alarm_commands = alarm.add_subparsers(dest="alarm_command", required=True)
+
+    alarm_start = alarm_commands.add_parser("start", help="start the alarm pattern")
+    alarm_start.add_argument(
+        "color", nargs="?", choices=ALARM_COLORS, default="red"
+    )
+    alarm_start.add_argument("--length", type=int, choices=range(1, 5), default=3)
+    alarm_start.add_argument("--speed", type=int, choices=range(1, 21), default=1)
+    alarm_start.set_defaults(handler=command_alarm_start)
+
+    alarm_stop = alarm_commands.add_parser("stop", help="stop the alarm pattern")
+    alarm_stop.set_defaults(handler=command_alarm_stop)
+
+    apply = subparsers.add_parser("apply", help="apply the saved configuration")
+    apply.set_defaults(handler=command_apply)
+
+    status = subparsers.add_parser("status", help="show service and hardware state")
+    status.set_defaults(handler=command_status)
+
+    daemon = subparsers.add_parser("daemon", help=argparse.SUPPRESS)
+    daemon.set_defaults(handler=command_daemon)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        args.handler(args)
+        return 0
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,509 @@
+#!/usr/bin/python3
+"""Validated VLAN configuration frontend for the SS5000 RTL8367C."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+
+SOURCE_RTKCTL = Path("/usr/local/sbin/ss5000-rtkctl")
+SOURCE_SHA256 = "3454ceccf0aa9a094d2db6a37756759605d4119dc3fb6e945e11d87172fbea68"
+CONFIG_PATH = Path("/etc/ss5000/l2sw-vlans.json")
+STATE_DIR = Path("/var/lib/ss5000-l2sw")
+ACTIVE_PATH = STATE_DIR / "active.json"
+ROLLBACK_PATH = STATE_DIR / "rollback.json"
+RUNTIME_BINARY = Path("/run/ss5000/rtkctl-configured")
+LOCK_PATH = Path("/run/ss5000/l2sw-config.lock")
+PCI_NET_PATH = Path("/sys/bus/pci/devices/0000:02:00.0/net")
+SYS_CLASS_NET = Path("/sys/class/net")
+IP = "/usr/sbin/ip"
+SERVICE = "ss5000-l2sw.service"
+MAX_CONFIG_SIZE = 65536
+
+PORTS = ("lan3", "lan4", "lan5", "lan6", "lan7")
+PORT_BITS = {name: bit for bit, name in enumerate(PORTS)}
+
+# File offsets of immediate operands in the saved vendor rtkctl.
+VLAN_SLOTS = (
+    # VID, member mask, untag mask, original VID/member/untag
+    (0x19A5, 0x19C0, 0x19C8, 3, 0x10001, 0x00001),
+    (0x19D5, 0x19ED, 0x19F5, 4, 0x10002, 0x00002),
+    (0x1A02, 0x1A1A, 0x1A22, 5, 0x10004, 0x00004),
+    (0x1A2F, 0x1A47, 0x1A4F, 6, 0x10008, 0x00008),
+    (0x1A5C, 0x1A74, 0x1A7C, 7, 0x10010, 0x00010),
+)
+PVID_OFFSETS = {
+    "lan3": (0x1A88, 3),
+    "lan4": (0x1A96, 4),
+    "lan5": (0x1AA7, 5),
+    "lan6": (0x1AB8, 6),
+    "lan7": (0x1AC9, 7),
+}
+CPU_PVID_OFFSET = (0x1ADA, 1)
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise ConfigError(message)
+
+
+def read_json(path: Path) -> Any:
+    try:
+        stat = path.stat()
+        if not path.is_file():
+            fail(f"{path}: regular file required")
+        if stat.st_size > MAX_CONFIG_SIZE:
+            fail(f"{path}: file is larger than {MAX_CONFIG_SIZE} bytes")
+        with path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        fail(f"{path}: not found")
+    except json.JSONDecodeError as exc:
+        fail(f"{path}:{exc.lineno}:{exc.colno}: {exc.msg}")
+
+
+def canonical_config(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        fail("top-level value must be an object")
+    allowed = {"version", "ports", "cpu_untagged_vlan"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        fail(f"unknown top-level keys: {', '.join(unknown)}")
+    if raw.get("version") != 1:
+        fail("version must be 1")
+
+    ports = raw.get("ports")
+    if not isinstance(ports, dict):
+        fail("ports must be an object")
+    missing = sorted(set(PORTS) - set(ports))
+    extra = sorted(set(ports) - set(PORTS))
+    if missing:
+        fail(f"missing ports: {', '.join(missing)}")
+    if extra:
+        fail(f"unknown ports: {', '.join(extra)}")
+
+    normalized_ports: dict[str, int] = {}
+    for name in PORTS:
+        vid = ports[name]
+        if isinstance(vid, bool) or not isinstance(vid, int):
+            fail(f"ports.{name} must be an integer VLAN ID")
+        if not 1 <= vid <= 4094:
+            fail(f"ports.{name} must be in the range 1..4094")
+        normalized_ports[name] = vid
+
+    unique_vids = sorted(set(normalized_ports.values()))
+    if len(unique_vids) > len(VLAN_SLOTS):
+        fail(f"at most {len(VLAN_SLOTS)} distinct VLANs are supported")
+
+    native = raw.get("cpu_untagged_vlan")
+    if native is not None:
+        if isinstance(native, bool) or not isinstance(native, int):
+            fail("cpu_untagged_vlan must be an integer VLAN ID or null")
+        if native not in unique_vids:
+            fail("cpu_untagged_vlan must match a VLAN assigned to a LAN port")
+
+    return {
+        "version": 1,
+        "ports": normalized_ports,
+        "cpu_untagged_vlan": native,
+    }
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    return canonical_config(read_json(path))
+
+
+def encode_json(config: dict[str, Any]) -> bytes:
+    return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def atomic_write(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    owner = None
+    try:
+        stat = path.stat()
+        owner = (stat.st_uid, stat.st_gid)
+    except FileNotFoundError:
+        pass
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        if owner is not None:
+            os.fchown(descriptor, *owner)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def patch_u32(
+    data: bytearray, offset: int, expected: int, replacement: int, label: str
+) -> None:
+    expected_bytes = expected.to_bytes(4, "little")
+    actual = bytes(data[offset : offset + 4])
+    if actual != expected_bytes:
+        fail(
+            f"{label}: unexpected source bytes at 0x{offset:x}: "
+            f"expected {expected_bytes.hex()}, found {actual.hex()}"
+        )
+    data[offset : offset + 4] = replacement.to_bytes(4, "little")
+
+
+def configured_vlans(config: dict[str, Any]) -> list[tuple[int, int, int]]:
+    result: list[tuple[int, int, int]] = []
+    native = config["cpu_untagged_vlan"]
+    for vid in sorted(set(config["ports"].values())):
+        physical_mask = sum(
+            1 << PORT_BITS[name]
+            for name, port_vid in config["ports"].items()
+            if port_vid == vid
+        )
+        member_mask = physical_mask | (1 << 16)
+        untag_mask = physical_mask | ((1 << 16) if native == vid else 0)
+        result.append((vid, member_mask, untag_mask))
+    return result
+
+
+def render_binary(config: dict[str, Any]) -> bytes:
+    raw = SOURCE_RTKCTL.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != SOURCE_SHA256:
+        fail(f"{SOURCE_RTKCTL}: unexpected SHA-256 {digest}")
+    data = bytearray(raw)
+
+    vlans = configured_vlans(config)
+    # There are five fixed calls in the vendor function. Repeating the final
+    # definition is harmless and avoids changing control flow for unused slots.
+    while len(vlans) < len(VLAN_SLOTS):
+        vlans.append(vlans[-1])
+
+    for index, (slot, values) in enumerate(zip(VLAN_SLOTS, vlans, strict=True)):
+        vid_offset, member_offset, untag_offset, old_vid, old_member, old_untag = slot
+        vid, member, untag = values
+        patch_u32(data, vid_offset, old_vid, vid, f"VLAN slot {index} VID")
+        patch_u32(data, member_offset, old_member, member, f"VLAN slot {index} member")
+        patch_u32(data, untag_offset, old_untag, untag, f"VLAN slot {index} untag")
+
+    for name in PORTS:
+        offset, old_vid = PVID_OFFSETS[name]
+        patch_u32(data, offset, old_vid, config["ports"][name], f"{name} PVID")
+
+    cpu_offset, old_cpu_pvid = CPU_PVID_OFFSET
+    cpu_pvid = config["cpu_untagged_vlan"] or 1
+    patch_u32(data, cpu_offset, old_cpu_pvid, cpu_pvid, "CPU PVID")
+    return bytes(data)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        fail("this operation must be run as root (use sudo)")
+
+
+@contextmanager
+def configuration_lock():
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def run_systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/usr/bin/systemctl", *arguments],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    )
+
+
+def command_validate(args: argparse.Namespace) -> None:
+    config = load_config(args.file)
+    print(json.dumps(config, indent=2, sort_keys=True))
+    print("configuration is valid")
+
+
+def command_show(args: argparse.Namespace) -> None:
+    config = load_config(args.file)
+    print(json.dumps(config, indent=2, sort_keys=True))
+    print("\nEffective switch layout:")
+    for vid, member, untag in configured_vlans(config):
+        members = [name for name in PORTS if member & (1 << PORT_BITS[name])]
+        cpu_mode = "untagged/native" if untag & (1 << 16) else "tagged"
+        print(f"  VLAN {vid}: {', '.join(members)}; CPU {cpu_mode}")
+
+
+def command_render(_: argparse.Namespace) -> None:
+    require_root()
+    config = load_config()
+    binary = render_binary(config)
+    atomic_write(RUNTIME_BINARY, binary, 0o700)
+    print(
+        f"rendered {RUNTIME_BINARY} "
+        f"sha256={hashlib.sha256(binary).hexdigest()}"
+    )
+
+
+def command_set(args: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        config["ports"][args.port] = args.vid
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        print(f"saved {args.port}=VLAN {args.vid}")
+        if args.apply:
+            apply_current_config_locked()
+
+
+def command_native(args: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        config = load_config()
+        if args.vid.lower() in {"none", "tagged"}:
+            config["cpu_untagged_vlan"] = None
+        else:
+            try:
+                config["cpu_untagged_vlan"] = int(args.vid, 10)
+            except ValueError:
+                fail("native VLAN must be 1..4094, 'none', or 'tagged'")
+        config = canonical_config(config)
+        atomic_write(CONFIG_PATH, encode_json(config), 0o640)
+        value = config["cpu_untagged_vlan"]
+        print(
+            "saved CPU mode: tagged"
+            if value is None
+            else f"saved CPU native VLAN {value}"
+        )
+        if args.apply:
+            apply_current_config_locked()
+
+
+def apply_current_config_locked() -> None:
+    desired = load_config()
+    previous = load_config(ACTIVE_PATH) if ACTIVE_PATH.exists() else None
+    result = run_systemctl("restart", SERVICE, check=False)
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr, end="")
+        if previous is not None:
+            print("apply failed; restoring the previous active configuration", file=sys.stderr)
+            atomic_write(CONFIG_PATH, encode_json(previous), 0o640)
+            rollback_result = run_systemctl("restart", SERVICE, check=False)
+            if rollback_result.returncode != 0:
+                print(rollback_result.stdout, file=sys.stderr, end="")
+                fail("apply and automatic hardware rollback both failed; use mgmt0 for recovery")
+        fail("configuration was rejected; previous active configuration restored")
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if previous is not None and previous != desired:
+        atomic_write(ROLLBACK_PATH, encode_json(previous), 0o600)
+    atomic_write(ACTIVE_PATH, encode_json(desired), 0o600)
+    print(result.stdout, end="")
+    print("configuration applied successfully")
+
+
+def apply_current_config() -> None:
+    require_root()
+    with configuration_lock():
+        apply_current_config_locked()
+
+
+def command_apply(_: argparse.Namespace) -> None:
+    apply_current_config()
+
+
+def command_rollback(_: argparse.Namespace) -> None:
+    require_root()
+    with configuration_lock():
+        rollback = load_config(ROLLBACK_PATH)
+        atomic_write(CONFIG_PATH, encode_json(rollback), 0o640)
+        apply_current_config_locked()
+
+
+def run_ip(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [IP, *arguments],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+    )
+
+
+def switch_interface() -> str:
+    try:
+        names = sorted(entry.name for entry in PCI_NET_PATH.iterdir())
+    except FileNotFoundError:
+        fail("switch-facing I210 is not bound")
+    if len(names) != 1:
+        fail(f"expected one switch-facing interface, found {len(names)}")
+    return names[0]
+
+
+def managed_vlan_link(name: str, parent: str, vid: int | None = None) -> bool:
+    result = run_ip("-details", "-json", "link", "show", "dev", name, check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        links = json.loads(result.stdout)
+        link = links[0]
+        linkinfo = link["linkinfo"]
+        actual_vid = int(linkinfo["info_data"]["id"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if linkinfo.get("info_kind") != "vlan" or link.get("link") != parent:
+        return False
+    return vid is None or actual_vid == vid
+
+
+def command_sync_links(_: argparse.Namespace) -> None:
+    """Reconcile Linux VLAN interfaces after the switch-facing I210 is rebound."""
+    require_root()
+    config = load_config()
+    parent = switch_interface()
+    native = config["cpu_untagged_vlan"]
+    desired_vids = sorted(set(config["ports"].values()) - {native})
+    desired_names = {f"l2v{vid}" for vid in desired_vids}
+
+    run_ip("link", "set", "dev", parent, "up")
+    for entry in SYS_CLASS_NET.iterdir():
+        if not re.fullmatch(r"l2v[1-9][0-9]{0,3}", entry.name):
+            continue
+        if entry.name in desired_names:
+            continue
+        if not managed_vlan_link(entry.name, parent):
+            fail(f"{entry.name} exists but is not a managed VLAN on {parent}")
+        run_ip("link", "delete", "dev", entry.name)
+
+    for vid in desired_vids:
+        name = f"l2v{vid}"
+        if (SYS_CLASS_NET / name).exists():
+            if not managed_vlan_link(name, parent, vid):
+                fail(f"{name} exists with an unexpected parent or VLAN ID")
+        else:
+            run_ip(
+                "link",
+                "add",
+                "link",
+                parent,
+                "name",
+                name,
+                "type",
+                "vlan",
+                "id",
+                str(vid),
+            )
+        run_ip("link", "set", "dev", name, "up")
+
+    mode = f"native VLAN {native} on {parent}" if native is not None else "fully tagged"
+    tagged = ", ".join(f"l2v{vid}" for vid in desired_vids) or "none"
+    print(f"Linux links synchronized: {mode}; tagged links: {tagged}")
+
+
+def command_status(_: argparse.Namespace) -> None:
+    config = load_config()
+    active = load_config(ACTIVE_PATH) if ACTIVE_PATH.exists() else None
+    enabled = run_systemctl("is-enabled", SERVICE, check=False).stdout.strip()
+    running = run_systemctl("is-active", SERVICE, check=False).stdout.strip()
+    print(f"service: {enabled}, {running}")
+    print(f"desired configuration: {CONFIG_PATH}")
+    print(f"desired equals active: {active == config}")
+    for vid, _, untag in configured_vlans(config):
+        cpu_mode = "native" if untag & (1 << 16) else "tagged"
+        ports = [name for name, value in config["ports"].items() if value == vid]
+        print(f"VLAN {vid}: ports={','.join(ports)} cpu={cpu_mode}")
+    if PCI_NET_PATH.exists():
+        try:
+            parent = switch_interface()
+            links = sorted(
+                entry.name
+                for entry in SYS_CLASS_NET.iterdir()
+                if re.fullmatch(r"l2v[1-9][0-9]{0,3}", entry.name)
+            )
+            print(f"Linux parent: {parent}; tagged links: {', '.join(links) or 'none'}")
+        except ConfigError as exc:
+            print(f"Linux links: {exc}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Configure SS5000 RTL8367C access-port VLANs safely"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate = subparsers.add_parser("validate", help="validate a configuration")
+    validate.add_argument("file", nargs="?", type=Path, default=CONFIG_PATH)
+    validate.set_defaults(handler=command_validate)
+
+    show = subparsers.add_parser("show", help="show effective VLAN membership")
+    show.add_argument("file", nargs="?", type=Path, default=CONFIG_PATH)
+    show.set_defaults(handler=command_show)
+
+    render = subparsers.add_parser("render", help=argparse.SUPPRESS)
+    render.set_defaults(handler=command_render)
+
+    sync_links = subparsers.add_parser("sync-links", help=argparse.SUPPRESS)
+    sync_links.set_defaults(handler=command_sync_links)
+
+    set_port = subparsers.add_parser("set", help="set one access port VLAN")
+    set_port.add_argument("port", choices=PORTS)
+    set_port.add_argument("vid", type=int)
+    set_port.add_argument("--apply", action="store_true")
+    set_port.set_defaults(handler=command_set)
+
+    native = subparsers.add_parser(
+        "native", help="set CPU native VLAN, or use 'tagged'"
+    )
+    native.add_argument("vid")
+    native.add_argument("--apply", action="store_true")
+    native.set_defaults(handler=command_native)
+
+    apply = subparsers.add_parser("apply", help="apply the saved configuration")
+    apply.set_defaults(handler=command_apply)
+
+    rollback = subparsers.add_parser("rollback", help="restore previous active config")
+    rollback.set_defaults(handler=command_rollback)
+
+    status = subparsers.add_parser("status", help="show service and VLAN status")
+    status.set_defaults(handler=command_status)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        args.handler(args)
+        return 0
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,12 @@
+[Unit]
+Description=Validate the SS5000 platform on first installed boot
+ConditionPathExists=!/var/lib/ss5000-install/firstboot-complete
+After=ss5000-l2sw.service ss5000-led.service ss5000-mgmt-prime.service ssh.socket
+Wants=ss5000-l2sw.service ss5000-led.service ss5000-mgmt-prime.service ssh.socket
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ss5000-firstboot-validate
+
+[Install]
+WantedBy=multi-user.target

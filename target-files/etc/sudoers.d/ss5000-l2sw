@@ -1,0 +1,2 @@
+%ss5000-admin ALL=(root) /usr/local/sbin/ss5000-l2sw-config *
+%ss5000-admin ALL=(root) /usr/local/sbin/ss5000-led *

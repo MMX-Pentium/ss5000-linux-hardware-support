@@ -1,0 +1,12 @@
+# The USB management adapter is renamed to mgmt0 by netplan.
+INTERFACE=mgmt0
+EXPECTED_DRIVER=asix
+EXPECTED_USB_ID=0b95:772b
+
+# An optional directly connected peer.  The probe reproduces the manual ping
+# that is known to make the post-reboot management path immediately usable.
+# Leave empty when the management PC uses a different address.
+PEER_IPV4=10.1.5.2
+
+# Link-state polling interval.  Every DOWN-to-UP transition is primed.
+POLL_SECONDS=1

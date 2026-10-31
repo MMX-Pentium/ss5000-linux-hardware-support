@@ -1,0 +1,18 @@
+[Unit]
+Description=Initialize SS5000 RTL8367C internal L2 switch
+ConditionPathExists=/sys/bus/pci/devices/0000:02:00.0
+After=systemd-modules-load.service
+Before=network-pre.target systemd-networkd.service NetworkManager.service
+Wants=network-pre.target
+StartLimitIntervalSec=90s
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ss5000-l2sw-init
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=network-pre.target

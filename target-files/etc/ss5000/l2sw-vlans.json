@@ -1,0 +1,11 @@
+{
+  "cpu_untagged_vlan": 20,
+  "ports": {
+    "lan3": 20,
+    "lan4": 20,
+    "lan5": 20,
+    "lan6": 20,
+    "lan7": 20
+  },
+  "version": 1
+}

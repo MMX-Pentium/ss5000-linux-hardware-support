@@ -1,0 +1,13 @@
+[Unit]
+Description=Control SS5000 front-panel LEDs
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ss5000-led daemon
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+
