@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 set -u
 
 STATE_DIR=/var/lib/ss5000-install

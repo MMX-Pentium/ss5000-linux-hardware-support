@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH

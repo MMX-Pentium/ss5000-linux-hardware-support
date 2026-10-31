@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 set -u
 
 CONFIG=/etc/default/ss5000-mgmt-prime
